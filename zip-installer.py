@@ -179,7 +179,7 @@ def run_install(archive_path):
     # start webview progress window if possible
     if webview:
         # load external HTML template to avoid f-string quoting issues
-        tpl_path = Path(__file__).parent / 'progress.html'
+        tpl_path = Path(__file__).parent / './html/progress.html'
         if tpl_path.exists():
             html = tpl_path.read_text(encoding='utf-8')
         else:
@@ -221,7 +221,7 @@ def run_install(archive_path):
 def show_settings():
     cfg = load_config()
     if webview:
-        tpl_path = Path(__file__).parent / 'settings.html'
+        tpl_path = Path(__file__).parent / './html/settings.html'
         if tpl_path.exists():
             html = tpl_path.read_text(encoding='utf-8')
         else:
@@ -252,7 +252,7 @@ def show_settings():
                     return ''
 
         api = Api()
-        webview.create_window('zip-installer 设置', html=html, js_api=api, width=700, height=220)
+        webview.create_window('zip-installer 设置', html=html, js_api=api, width=700, height=600)
         webview.start()
     else:
         # CLI fallback: allow typing path or open dialog via tkinter
