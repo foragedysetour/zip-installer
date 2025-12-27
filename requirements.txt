@@ -1,6 +1,0 @@
-pywebview
-plyer
-win10toast_click
-pyinstaller
-# Optional: if you prefer python-only 7z handling
-# py7zr

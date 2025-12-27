@@ -1,327 +1,299 @@
-import sys
 import os
+import sys
 import json
-import subprocess
 import threading
+import subprocess
 import shutil
+import re
 from pathlib import Path
 
 try:
-    import webview
+	import tkinter as tk
+	from tkinter import ttk, filedialog, messagebox
 except Exception:
-    webview = None
+	tk = None
 
-try:
-    from plyer import notification as plyer_notify
-except Exception:
-    plyer_notify = None
-
-try:
-    from win10toast_click import ToastNotifier
-except Exception:
-    ToastNotifier = None
-
-CONFIG_FILE = Path.home() / '.zip-installer_config.json'
+CONFIG_FILE = Path(__file__).with_name('config.json')
 
 
 def load_config():
-    if CONFIG_FILE.exists():
-        try:
-            return json.loads(CONFIG_FILE.read_text(encoding='utf-8'))
-        except Exception:
-            pass
-    return {"target_path": str(Path.home() / 'zip-installerInstalls')}
+	if CONFIG_FILE.exists():
+		try:
+			return json.loads(CONFIG_FILE.read_text(encoding='utf-8'))
+		except Exception:
+			return {}
+	return {}
 
 
 def save_config(cfg):
-    CONFIG_FILE.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding='utf-8')
+	CONFIG_FILE.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding='utf-8')
 
 
-def ensure_dir(path):
-    Path(path).mkdir(parents=True, exist_ok=True)
+def find_7z():
+	from shutil import which
+	exe = which('7z') or which('7z.exe')
+	if exe:
+		return exe
+	# try common install path
+	program_files = os.environ.get('ProgramFiles', r'C:\Program Files')
+	candidate = Path(program_files) / '7-Zip' / '7z.exe'
+	if candidate.exists():
+		return str(candidate)
+	return None
 
 
-def is_elevated():
-    if os.name != 'nt':
-        return True
-    try:
-        import ctypes
-        return ctypes.windll.shell32.IsUserAnAdmin() != 0
-    except Exception:
-        return False
+def ensure_base_path(cfg):
+	base = cfg.get('base_path')
+	if base and Path(base).exists():
+		return base
+	return None
 
 
-def relaunch_as_admin(args):
-    import ctypes
-    params = ' '.join(['"%s"' % a for a in args])
-    executable = sys.executable
-    ctypes.windll.shell32.ShellExecuteW(None, 'runas', executable, params, None, 1)
+def extract_with_7z(archive, dest_dir, progress_callback=None):
+	exe = find_7z()
+	if not exe:
+		raise RuntimeError('7z.exe 未找到，请安装 7-Zip 并将其添加到 PATH。')
+
+	dest_dir = str(dest_dir)
+	cmd = [exe, 'x', str(archive), f'-o{dest_dir}', '-y']
+	# run and parse percent
+	proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=1, text=True, universal_newlines=True)
+	percent = 0
+	pattern = re.compile(r"(\d+)%")
+	for line in proc.stdout:
+		if progress_callback:
+			m = pattern.search(line)
+			if m:
+				try:
+					percent = int(m.group(1))
+				except Exception:
+					pass
+				progress_callback(min(percent, 100), line.strip())
+	proc.wait()
+	if proc.returncode != 0:
+		raise RuntimeError(f'7z 返回错误码 {proc.returncode}')
 
 
-class ProgressAPI:
-    def __init__(self):
-        self.progress = 0
-        self.message = ''
-
-    def update(self, p, msg=''):
-        try:
-            p = int(p)
-        except Exception:
-            p = 0
-        self.progress = max(0, min(100, p))
-        self.message = msg
+def open_in_explorer(path):
+	try:
+		subprocess.Popen(['explorer', str(path)])
+	except Exception:
+		pass
 
 
-def send_notifications(title, message, folder):
-    # plyer notification (cross-platform)
-    if plyer_notify:
-        try:
-            plyer_notify.notify(title=title, message=message)
-        except Exception:
-            pass
+def notify_completion(folder):
+	# try win10toast_click if available
+	try:
+		from win10toast_click import ToastNotifier
+		toaster = ToastNotifier()
+		def _on_click():
+			open_in_explorer(folder)
+		toaster.show_toast('解压完成', f'已解压到: {folder}', duration=10, threaded=True, callback_on_click=_on_click)
+		return
+	except Exception:
+		pass
 
-    # On Windows use win10toast_click to provide clickable toast
-    if ToastNotifier and os.name == 'nt':
-        try:
-            toaster = ToastNotifier()
-            def _open():
-                subprocess.Popen(['explorer', str(folder)])
-            toaster.show_toast(title, message, icon_path=None, duration=10, threaded=True, callback_on_click=_open)
-        except Exception:
-            pass
-
-
-def extract_zip_with_progress(src, dest, api=None):
-    import zipfile
-    with zipfile.ZipFile(src, 'r') as zf:
-        namelist = zf.namelist()
-        total = len(namelist)
-        for i, name in enumerate(namelist, 1):
-            target_path = Path(dest) / name
-            if name.endswith('/'):
-                target_path.mkdir(parents=True, exist_ok=True)
-            else:
-                ensure_dir(target_path.parent)
-                with zf.open(name) as source, open(target_path, 'wb') as out:
-                    shutil.copyfileobj(source, out)
-            if api:
-                api.update(int(i / total * 100), f'Extracting {name}')
+	# fallback: simple tkinter info dialog with Open button
+	if tk:
+		root = tk.Tk()
+		root.withdraw()
+		if messagebox.askyesno('解压完成', f'已解压到:\n{folder}\n\n是否打开目录?'):
+			open_in_explorer(folder)
+		root.destroy()
+	else:
+		print('已解压到:', folder)
 
 
-def extract_with_7z(src, dest, api=None):
-    # Use 7z if available (7z.exe in PATH)
-    cmd = ['7z', 'x', str(src), '-o' + str(dest), '-y']
-    try:
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
-    except FileNotFoundError:
-        raise RuntimeError('7z not found in PATH')
+class ProgressWindow:
+	def __init__(self, title='解压中'):
+		if not tk:
+			self._dummy = True
+			return
+		self._dummy = False
+		self.root = tk.Tk()
+		self.root.title(title)
+		self.root.geometry('420x120')
+		self.label = ttk.Label(self.root, text='准备解压...')
+		self.label.pack(pady=8)
+		self.pb = ttk.Progressbar(self.root, length=380)
+		self.pb.pack(padx=10)
+		self.log = tk.Text(self.root, height=3, width=50, state='disabled')
+		self.log.pack(padx=8, pady=8)
 
-    for line in proc.stdout:
-        line = line.strip()
-        # attempt to parse percentage
-        if '%' in line:
-            try:
-                p = int(line.split('%')[-2].split()[-1])
-                if api:
-                    api.update(p, line)
-            except Exception:
-                pass
-    proc.wait()
-    if proc.returncode != 0:
-        raise RuntimeError('7z failed')
+	def start(self):
+		if self._dummy:
+			return
+		threading.Thread(target=self.root.mainloop, daemon=True).start()
 
+	def update(self, percent, line=None):
+		if self._dummy:
+			print(percent, line)
+			return
+		def _upd():
+			self.pb['value'] = percent
+			self.label.config(text=f'进度: {percent}%')
+			if line:
+				self.log['state'] = 'normal'
+				self.log.insert('end', line + '\n')
+				self.log.see('end')
+				self.log['state'] = 'disabled'
+		self.root.after(0, _upd)
 
-def extract_archive(src, dest, api=None):
-    ext = Path(src).suffix.lower()
-    if ext == '.zip':
-        extract_zip_with_progress(src, dest, api)
-    else:
-        # try 7z for rar/7z/others
-        extract_with_7z(src, dest, api)
-
-
-def confirm_replace(target):
-    # simple CLI fallback confirmation when no GUI
-    if any(Path(target).iterdir()):
-        resp = input(f'目标目录 {target} 非空，是否覆盖? (y/n): ')
-        return resp.lower().startswith('y')
-    return True
-
-
-def run_install(archive_path):
-    cfg = load_config()
-    base = Path(archive_path).stem
-    target_root = Path(cfg.get('target_path'))
-    target_dir = target_root / base
-    ensure_dir(target_root)
-    if target_dir.exists() and any(target_dir.iterdir()):
-        # ask user
-        # If pywebview present we could show a dialog, but here do a simple console prompt
-        if webview:
-            # show a tiny webview confirm dialog
-            def confirm_thread():
-                webview.create_window('确认', html=f"<h3>目标目录已存在: {target_dir}</h3><p>是否覆盖？</p>", width=400, height=200)
-            t = threading.Thread(target=confirm_thread, daemon=True)
-            t.start()
-            # fallback to CLI
-            if not confirm_replace(target_dir):
-                print('取消')
-                return
-        else:
-            if not confirm_replace(target_dir):
-                print('取消')
-                return
-        shutil.rmtree(target_dir)
-
-    ensure_dir(target_dir)
-    api = ProgressAPI()
-
-    # start webview progress window if possible
-    if webview:
-        # load external HTML template to avoid f-string quoting issues
-        tpl_path = Path(__file__).parent / './html/progress.html'
-        if tpl_path.exists():
-            html = tpl_path.read_text(encoding='utf-8')
-        else:
-            # fallback minimal HTML
-            html = """
-            <html><body><h3 id='msg'>准备解压</h3><div style='width:80%;background:#eee;border-radius:8px;padding:3px'><div id='bar' style='width:0%;height:24px;background:linear-gradient(90deg,#4caf50,#8bc34a);border-radius:6px'></div></div><script>function setProgress(p,msg){document.getElementById('bar').style.width = p+'%';document.getElementById('msg').innerText = msg + ' ('+p+'%)';}</script></body></html>
-            """
-        win = webview.create_window('解压进度', html=html, width=500, height=200)
-
-        def background_extract():
-            try:
-                extract_archive(archive_path, target_dir, api)
-                send_notifications('安装完成', f'{archive_path} 已解压到 {target_dir}', target_dir)
-            except Exception as e:
-                send_notifications('安装失败', str(e), target_dir)
-
-        threading.Thread(target=background_extract, daemon=True).start()
-        # poll to update UI
-        def update_poll():
-            while True:
-                # use json.dumps to safely escape the message string for JS
-                webview.evaluate_js(win, f"setProgress({api.progress}, {json.dumps(api.message)})")
-                if api.progress >= 100:
-                    break
-                import time
-                time.sleep(0.5)
-
-        threading.Thread(target=update_poll, daemon=True).start()
-        webview.start()
-    else:
-        # No GUI, do extraction and print progress
-        try:
-            extract_archive(archive_path, target_dir, api)
-            send_notifications('安装完成', f'{archive_path} 已解压到 {target_dir}', target_dir)
-        except Exception as e:
-            send_notifications('安装失败', str(e), target_dir)
+	def close(self):
+		if self._dummy:
+			return
+		try:
+			self.root.quit()
+			self.root.destroy()
+		except Exception:
+			pass
 
 
-def show_settings():
-    cfg = load_config()
-    if webview:
-        tpl_path = Path(__file__).parent / './html/settings.html'
-        if tpl_path.exists():
-            html = tpl_path.read_text(encoding='utf-8')
-        else:
-            # fallback minimal HTML
-            html = """
-            <html><body><h3>设置目标路径</h3><input id='path' /><button onclick="window.pywebview.api.save(document.getElementById('path').value)">保存</button></body></html>
-            """
+def process_archive(archive_path, cfg):
+	archive_path = Path(archive_path)
+	if not archive_path.exists():
+		raise FileNotFoundError(archive_path)
 
-        class Api:
-            def get_initial(self):
-                return cfg.get('target_path')
+	base_path = cfg.get('base_path')
+	if not base_path:
+		raise RuntimeError('未配置保存路径，请在程序中设置 base_path')
 
-            def save(self, p):
-                cfg['target_path'] = p
-                save_config(cfg)
-                return True
+	name = archive_path.stem
+	dest = Path(base_path) / name
+	if dest.exists() and any(dest.iterdir()):
+		if tk:
+			root = tk.Tk(); root.withdraw()
+			res = messagebox.askyesno('目标已存在', f'目标文件夹 {dest} 已存在且包含文件。是否替换?')
+			root.destroy()
+			if not res:
+				return 'cancelled'
+			shutil.rmtree(dest)
+		else:
+			# no gui: cancel
+			return 'cancelled'
 
-            def choose(self):
-                try:
-                    import tkinter as tk
-                    from tkinter import filedialog
-                    root = tk.Tk()
-                    root.withdraw()
-                    path = filedialog.askdirectory()
-                    root.destroy()
-                    return path or ''
-                except Exception:
-                    return ''
+	dest.mkdir(parents=True, exist_ok=True)
 
-        api = Api()
-        webview.create_window('zip-installer 设置', html=html, js_api=api, width=700, height=600)
-        webview.start()
-    else:
-        # CLI fallback: allow typing path or open dialog via tkinter
-        try:
-            import tkinter as tk
-            from tkinter import filedialog
-            root = tk.Tk()
-            root.withdraw()
-            print(f'当前目标路径: {cfg.get("target_path")}')
-            if input('按回车使用当前路径，或输入 c 调用目录选择: ').strip().lower() == 'c':
-                p = filedialog.askdirectory()
-                root.destroy()
-                if p:
-                    cfg['target_path'] = p
-                    save_config(cfg)
-            else:
-                root.destroy()
-        except Exception:
-            p = input(f'目标路径 (回车使用 {cfg.get("target_path")}): ')
-            if p.strip():
-                cfg['target_path'] = p.strip()
-                save_config(cfg)
+	pw = ProgressWindow(title=f'正在解压 {archive_path.name}')
+	pw.start()
+
+	def progress_cb(pct, line):
+		pw.update(pct, line)
+
+	exception = None
+	try:
+		extract_with_7z(archive_path, dest, progress_callback=progress_cb)
+	except Exception as e:
+		exception = e
+	finally:
+		pw.update(100, '完成')
+		pw.close()
+
+	if exception:
+		raise exception
+
+	notify_completion(str(dest))
+	return str(dest)
 
 
-def register_context_menu():
-    # Register per-user context menu entries for .zip .rar .7z
-    if os.name != 'nt':
-        print('仅支持 Windows 注册右键菜单')
-        return
-    import winreg
-    exe = sys.executable
-    # if packaged, sys.argv[0] might be the exe
-    script = Path(sys.argv[0]).resolve()
-    cmd = f'"{exe}" "{script}" --install "%1"'
-    exts = ['.zip', '.rar', '.7z']
-    for e in exts:
-        try:
-            key_path = f'Software\\Classes\\{e}\\shell\\从此文件安装\\command'
-            with winreg.CreateKey(winreg.HKEY_CURRENT_USER, key_path) as k:
-                winreg.SetValueEx(k, None, 0, winreg.REG_SZ, cmd)
-            print(f'已为 {e} 注册右键菜单')
-        except Exception as ex:
-            print('注册失败', ex)
+def register_associations():
+	# per-user registration via HKCU\Software\Classes
+	try:
+		import winreg
+		script = str(Path(__file__).absolute())
+		cmd = f'"{sys.executable}" "{script}" "%1"'
+		exts = ['.zip', '.7z', '.rar']
+		for ext in exts:
+			with winreg.CreateKey(winreg.HKEY_CURRENT_USER, f'Software\\Classes\\{ext}') as k:
+				winreg.SetValue(k, '', winreg.REG_SZ, 'zip-installer.archive')
+		with winreg.CreateKey(winreg.HKEY_CURRENT_USER, 'Software\\Classes\\zip-installer.archive') as k:
+			winreg.SetValue(k, '', winreg.REG_SZ, 'Zip Installer Archive')
+		with winreg.CreateKey(winreg.HKEY_CURRENT_USER, 'Software\\Classes\\zip-installer.archive\\shell\\open\\command') as k:
+			winreg.SetValue(k, '', winreg.REG_SZ, cmd)
+		return True
+	except Exception as e:
+		return False
+
+
+def settings_gui():
+	cfg = load_config()
+	if not tk:
+		print('需要 GUI 支持来配置路径')
+		return
+	root = tk.Tk()
+	root.title('Zip Installer 设置')
+	root.geometry('480x160')
+
+	frm = ttk.Frame(root, padding=12)
+	frm.pack(fill='both', expand=True)
+
+	ttk.Label(frm, text='解压保存路径:').pack(anchor='w')
+	path_var = tk.StringVar(value=cfg.get('base_path', ''))
+	entry = ttk.Entry(frm, textvariable=path_var, width=60)
+	entry.pack(fill='x', pady=6)
+
+	def browse():
+		p = filedialog.askdirectory()
+		if p:
+			path_var.set(p)
+
+	ttk.Button(frm, text='浏览...', command=browse).pack(anchor='e')
+
+	def save_and_close():
+		cfg['base_path'] = path_var.get()
+		save_config(cfg)
+		messagebox.showinfo('已保存', '配置已保存。')
+		root.destroy()
+
+	def do_register():
+		ok = register_associations()
+		if ok:
+			messagebox.showinfo('完成', '已为当前用户注册 .zip .7z .rar 的打开方式。')
+		else:
+			messagebox.showwarning('失败', '注册失败，请以管理员身份运行以写入系统注册表。')
+
+	btns = ttk.Frame(frm)
+	btns.pack(fill='x', pady=8)
+	ttk.Button(btns, text='保存', command=save_and_close).pack(side='right')
+	ttk.Button(btns, text='注册为默认打开程序', command=do_register).pack(side='left')
+
+	try:
+		root.mainloop()
+	except KeyboardInterrupt:
+		try:
+			root.quit()
+			root.destroy()
+		except Exception:
+			pass
 
 
 def main():
-    if len(sys.argv) >= 2 and sys.argv[1] == '--install':
-        if len(sys.argv) < 3:
-            print('缺少文件路径')
-            return
-        archive = sys.argv[2]
-        # check privileges for target path
-        cfg = load_config()
-        target_root = Path(cfg.get('target_path'))
-        if not os.access(str(target_root), os.W_OK):
-            if not is_elevated():
-                # relaunch as admin
-                relaunch_as_admin(sys.argv)
-                return
-        run_install(archive)
-        return
+	cfg = load_config()
+	if len(sys.argv) > 1:
+		# opened with a file
+		archive = sys.argv[1]
+		try:
+			dest = process_archive(archive, cfg)
+			if dest == 'cancelled':
+				print('用户取消')
+		except Exception as e:
+			if tk:
+				root = tk.Tk(); root.withdraw(); messagebox.showerror('错误', str(e)); root.destroy()
+			else:
+				print('错误:', e)
+		return
 
-    # no args -> settings and registration helper
-    if '--register' in sys.argv:
-        register_context_menu()
-        return
-
-    show_settings()
+	# no args: open settings gui
+	try:
+		settings_gui()
+	except KeyboardInterrupt:
+		# user pressed Ctrl+C in terminal; exit gracefully
+		try:
+			print('\n已中断，退出。')
+		except Exception:
+			pass
 
 
 if __name__ == '__main__':
-    main()
+	main()
+

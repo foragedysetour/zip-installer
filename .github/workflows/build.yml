@@ -29,7 +29,7 @@ jobs:
         
     - name: 使用PyInstaller构建可执行文件（包含资源）
       run: |
-        pyinstaller -w -F --hidden-import plyer.platforms.win.notification zip-installer.py --add-data "html;html"
+        pyinstaller -w -F zip-installer.py
 
     - name: 上传构建工件
       uses: actions/upload-artifact@v4
